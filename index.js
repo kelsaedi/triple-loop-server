@@ -24,25 +24,27 @@ function loadKnowledgeBase() {
     const kbPath = path.join(__dirname, 'knowledge_base.txt');
     const content = fs.readFileSync(kbPath, 'utf-8');
 
-    // In Absätze aufteilen (doppelte Zeilenumbrüche)
-    const paragraphs = content.split(/\n\n+/).filter(p => p.trim().length > 50);
-
-    // Chunks erstellen (ca. 1500 Zeichen pro Chunk für besseren Kontext)
+    // Text in Chunks von ca. 2000 Zeichen aufteilen
     knowledgeChunks = [];
-    let currentChunk = '';
+    const chunkSize = 2000;
 
-    for (const para of paragraphs) {
-      if (currentChunk.length + para.length > 800) {
-        if (currentChunk.trim()) {
-          knowledgeChunks.push(currentChunk.trim());
+    for (let i = 0; i < content.length; i += chunkSize) {
+      let chunk = content.slice(i, i + chunkSize);
+
+      // Versuche am Satzende oder Zeilenumbruch zu schneiden
+      if (i + chunkSize < content.length) {
+        const lastPeriod = chunk.lastIndexOf('. ');
+        const lastNewline = chunk.lastIndexOf('\n');
+        const cutPoint = Math.max(lastPeriod, lastNewline);
+        if (cutPoint > chunkSize * 0.5) {
+          chunk = chunk.slice(0, cutPoint + 1);
+          i = i - (chunkSize - cutPoint - 1); // Adjust next start
         }
-        currentChunk = para;
-      } else {
-        currentChunk += '\n\n' + para;
       }
-    }
-    if (currentChunk.trim()) {
-      knowledgeChunks.push(currentChunk.trim());
+
+      if (chunk.trim().length > 100) {
+        knowledgeChunks.push(chunk.trim());
+      }
     }
 
     console.log(`✓ Knowledge Base geladen: ${knowledgeChunks.length} Chunks`);
