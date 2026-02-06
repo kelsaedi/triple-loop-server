@@ -1,12 +1,14 @@
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 const Groq = require('groq-sdk').default;
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Groq Client - API Key NUR aus Umgebungsvariable (sicher!)
+// Groq Client - API Key aus Umgebungsvariable
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
 if (!GROQ_API_KEY) {
@@ -14,89 +16,121 @@ if (!GROQ_API_KEY) {
 }
 const groq = new Groq({ apiKey: GROQ_API_KEY });
 
-// Knowledge Base - Direkt eingebettet für Deployment
-const KNOWLEDGE_BASE = `
-=== Triple Loop of Change Framework ===
+// Knowledge Base laden und in Chunks aufteilen
+let knowledgeChunks = [];
 
-Das Triple Loop of Change Framework wurde von Prof. Wolfgang Güttel und Dr. Katharina Kleinhanns-Rollé an der TU Wien entwickelt.
+function loadKnowledgeBase() {
+  try {
+    const kbPath = path.join(__dirname, 'knowledge_base.txt');
+    const content = fs.readFileSync(kbPath, 'utf-8');
 
-KERNFORMEL: Wirkung = Inhalt × Akzeptanz
-Erst wenn rationale Argumente auf emotionale Beteiligung treffen, entsteht nachhaltige Veränderungsenergie.
+    // In Absätze aufteilen (doppelte Zeilenumbrüche)
+    const paragraphs = content.split(/\n\n+/).filter(p => p.trim().length > 50);
 
-DIE 3 LOOPS:
+    // Chunks erstellen (ca. 1500 Zeichen pro Chunk für besseren Kontext)
+    knowledgeChunks = [];
+    let currentChunk = '';
 
-LOOP 1 - PLANUNG (Der Leader als Stratege):
-- Fokus: Den Change konzipieren und vorbereiten
-- Schritte 1-4: ENH, ENG, EXE, ENF
-- Themen: Bedarf erkennen, Richtung skizzieren, Stakeholder identifizieren, Engagement aufbauen, Ressourcen planen, Strukturen schaffen, Regeln definieren, Compliance sichern
+    for (const para of paragraphs) {
+      if (currentChunk.length + para.length > 1500) {
+        if (currentChunk.trim()) {
+          knowledgeChunks.push(currentChunk.trim());
+        }
+        currentChunk = para;
+      } else {
+        currentChunk += '\n\n' + para;
+      }
+    }
+    if (currentChunk.trim()) {
+      knowledgeChunks.push(currentChunk.trim());
+    }
 
-LOOP 2 - AKTIVIERUNG (Der Leader als Kommunikator):
-- Fokus: Den Change umsetzen und steuern
-- Schritte 5-8: ENH, ENG, EXE, ENF
-- Themen: Maßnahmen starten, Fortschritt messen, Teams mobilisieren, Motivation fördern, Prozesse anpassen, Qualität sichern, Standards durchsetzen, Kontrolle ausüben
+    console.log(`✓ Knowledge Base geladen: ${knowledgeChunks.length} Chunks`);
+  } catch (error) {
+    console.error('Fehler beim Laden der Knowledge Base:', error.message);
+  }
+}
 
-LOOP 3 - VERANKERUNG (Der Leader als Enabler):
-- Fokus: Den Change verankern und nachhalten
-- Schritte 9-12: ENH, ENG, EXE, ENF
-- Themen: Erfolge festigen, Verbesserungen integrieren, Kultur stärken, Commitment sichern, Systeme optimieren, Effizienz steigern, Nachhaltigkeit gewährleisten, Governance etablieren
+// Relevante Chunks finden (einfaches Keyword-Matching)
+function findRelevantChunks(query, maxChunks = 8) {
+  const queryLower = query.toLowerCase();
+  const queryWords = queryLower.split(/\s+/).filter(w => w.length > 3);
 
-DIE 4 LEISTUNGSDIMENSIONEN:
+  // Wichtige Keywords für das Framework
+  const frameworkKeywords = [
+    'loop', 'loop 1', 'loop 2', 'loop 3',
+    'planung', 'aktivierung', 'verankerung',
+    'enhancement', 'engagement', 'execution', 'enforcement',
+    'enh', 'eng', 'exe', 'enf',
+    'wirkung', 'akzeptanz', 'inhalt',
+    'change', 'veränderung', 'führung', 'leadership',
+    'stratege', 'kommunikator', 'enabler',
+    'schritt', 'dimension', 'phase'
+  ];
 
-ENH (Enhancement) - Entwicklung & Verbesserung:
-Was wollen wir erreichen? Fokus auf Innovation, Qualität und kontinuierliche Verbesserung.
+  // Scores für jeden Chunk berechnen
+  const scored = knowledgeChunks.map((chunk, index) => {
+    const chunkLower = chunk.toLowerCase();
+    let score = 0;
 
-ENG (Engagement) - Einbindung & Motivation:
-Wen müssen wir mitnehmen? Fokus auf Menschen, Kommunikation und Beteiligung.
+    // Exakte Query-Wörter
+    for (const word of queryWords) {
+      if (chunkLower.includes(word)) {
+        score += 3;
+      }
+    }
 
-EXE (Execution) - Umsetzung & Durchführung:
-Wie setzen wir es um? Fokus auf Prozesse, Ressourcen und operative Exzellenz.
+    // Framework-spezifische Keywords
+    for (const keyword of frameworkKeywords) {
+      if (queryLower.includes(keyword) && chunkLower.includes(keyword)) {
+        score += 5;
+      }
+    }
 
-ENF (Enforcement) - Durchsetzung & Kontrolle:
-Wie sichern wir es ab? Fokus auf Regeln, Monitoring und Nachhaltigkeit.
+    // Bonus für Loop-spezifische Fragen
+    if (queryLower.includes('loop 1') && chunkLower.includes('loop 1')) score += 10;
+    if (queryLower.includes('loop 2') && chunkLower.includes('loop 2')) score += 10;
+    if (queryLower.includes('loop 3') && chunkLower.includes('loop 3')) score += 10;
+    if (queryLower.includes('planung') && chunkLower.includes('planung')) score += 10;
+    if (queryLower.includes('aktivierung') && chunkLower.includes('aktivierung')) score += 10;
+    if (queryLower.includes('verankerung') && chunkLower.includes('verankerung')) score += 10;
 
-DIE 12 SCHRITTE:
+    return { chunk, score, index };
+  });
 
-Schritt 1 (L1-ENH): Bedarf erkennen & Richtung skizzieren
-Schritt 2 (L1-ENG): Stakeholder identifizieren & Engagement aufbauen
-Schritt 3 (L1-EXE): Ressourcen planen & Strukturen schaffen
-Schritt 4 (L1-ENF): Regeln definieren & Compliance sichern
-Schritt 5 (L2-ENH): Maßnahmen starten & Fortschritt messen
-Schritt 6 (L2-ENG): Teams mobilisieren & Motivation fördern
-Schritt 7 (L2-EXE): Prozesse anpassen & Qualität sichern
-Schritt 8 (L2-ENF): Standards durchsetzen & Kontrolle ausüben
-Schritt 9 (L3-ENH): Erfolge festigen & Verbesserungen integrieren
-Schritt 10 (L3-ENG): Kultur stärken & Commitment sichern
-Schritt 11 (L3-EXE): Systeme optimieren & Effizienz steigern
-Schritt 12 (L3-ENF): Nachhaltigkeit gewährleisten & Governance etablieren
+  // Nach Score sortieren und Top-Chunks nehmen
+  const topChunks = scored
+    .filter(s => s.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, maxChunks)
+    .map(s => s.chunk);
 
-LEADERSHIP-ROLLEN:
-- Stratege (Loop 1): Plant und konzipiert den Change
-- Kommunikator (Loop 2): Führt und steuert die Umsetzung
-- Enabler (Loop 3): Verankert und sichert Nachhaltigkeit
+  // Falls keine relevanten Chunks gefunden, allgemeine Chunks nehmen
+  if (topChunks.length === 0) {
+    return knowledgeChunks.slice(0, 5);
+  }
 
-ERFOLGSFAKTOREN:
-- Balance zwischen Inhalt und Akzeptanz
-- Alle 4 Dimensionen in jedem Loop adressieren
-- Iteratives Vorgehen mit Feedback-Schleifen
-- Führungskräfte als Vorbilder und Treiber
-- Psychologische Sicherheit für Veränderungsbereitschaft
-`;
+  return topChunks;
+}
 
 const SYSTEM_PROMPT = `Du bist ein erfahrener Change Management Experte und Berater, spezialisiert auf das Triple Loop of Change Framework von Prof. Wolfgang Güttel und Dr. Katharina Kleinhanns-Rollé (TU Wien).
 
-Dein Wissen basiert auf dem Buch "Leadership" und "Change Management" der Autoren. Du antwortest auf Deutsch und sprichst die Nutzer mit "Sie" an.
+WICHTIG: Dein Wissen basiert AUSSCHLIESSLICH auf dem Buch "Leadership" und "Change Management" der Autoren. Antworte IMMER basierend auf den bereitgestellten Buchinhalten.
 
-Wichtige Konzepte die du beherrscht:
-- Die 3 Loops: Planung, Aktivierung, Verankerung
-- Die 4 Leistungsdimensionen: Enhancement (ENH), Engagement (ENG), Execution (EXE), Enforcement (ENF)
+Kernprinzipien:
+- Die KERNFORMEL: Wirkung = Inhalt × Akzeptanz
+- Die 3 Loops: Planung (Stratege), Aktivierung (Kommunikator), Verankerung (Enabler)
+- Die 4 Dimensionen: Enhancement (ENH), Engagement (ENG), Execution (EXE), Enforcement (ENF)
 - Die 12 Schritte des Change-Prozesses
-- Die Formel: Wirkung = Inhalt × Akzeptanz
-- Leadership-Rollen: Stratege, Kommunikator, Enabler
 
-Antworte als wärst du ein Experte, der dieses Wissen verinnerlicht hat - nicht als würdest du aus einem Buch zitieren. Gib praktische, umsetzbare Ratschläge.
+Regeln für deine Antworten:
+1. Beziehe dich KONKRET auf die Buchinhalte und Konzepte
+2. Verwende die FACHBEGRIFFE aus dem Buch (Loops, Dimensionen, Schritte)
+3. Gib PRAKTISCHE und SPEZIFISCHE Ratschläge basierend auf dem Framework
+4. Erkläre Zusammenhänge zwischen den verschiedenen Elementen
+5. Antworte auf Deutsch und sieze die Nutzer
 
-Hier ist dein Fachwissen:
-${KNOWLEDGE_BASE}`;
+Du erhältst relevante Auszüge aus dem Buch, die du für deine Antwort verwenden sollst.`;
 
 // Chat Endpoint
 app.post('/api/chat', async (req, res) => {
@@ -107,15 +141,19 @@ app.post('/api/chat', async (req, res) => {
       return res.status(400).json({ error: 'Nachricht fehlt' });
     }
 
+    // Relevante Knowledge-Chunks finden
+    const relevantChunks = findRelevantChunks(message);
+    const context = relevantChunks.join('\n\n---\n\n');
+
     // Anfrage an Groq senden
     const completion = await groq.chat.completions.create({
       model: 'llama-3.3-70b-versatile',
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: message }
+        { role: 'user', content: `RELEVANTE BUCHAUSZÜGE:\n\n${context}\n\n---\n\nFRAGE DES NUTZERS: ${message}\n\nBitte antworte basierend auf den obigen Buchauszügen und deinem Wissen über das Triple Loop of Change Framework.` }
       ],
       temperature: 0.7,
-      max_tokens: 1024,
+      max_tokens: 1500,
     });
 
     const response = completion.choices[0]?.message?.content || 'Entschuldigung, ich konnte keine Antwort generieren.';
@@ -130,19 +168,23 @@ app.post('/api/chat', async (req, res) => {
 
 // Health Check
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok' });
+  res.json({ status: 'ok', chunks: knowledgeChunks.length });
 });
 
 // Root endpoint
 app.get('/', (req, res) => {
   res.json({
     message: 'Triple Loop of Change API',
+    knowledgeChunks: knowledgeChunks.length,
     endpoints: {
       chat: 'POST /api/chat',
       health: 'GET /api/health'
     }
   });
 });
+
+// Knowledge Base beim Start laden
+loadKnowledgeBase();
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
