@@ -32,7 +32,7 @@ function loadKnowledgeBase() {
     let currentChunk = '';
 
     for (const para of paragraphs) {
-      if (currentChunk.length + para.length > 1500) {
+      if (currentChunk.length + para.length > 800) {
         if (currentChunk.trim()) {
           knowledgeChunks.push(currentChunk.trim());
         }
@@ -52,7 +52,7 @@ function loadKnowledgeBase() {
 }
 
 // Relevante Chunks finden (einfaches Keyword-Matching)
-function findRelevantChunks(query, maxChunks = 8) {
+function findRelevantChunks(query, maxChunks = 4) {
   const queryLower = query.toLowerCase();
   const queryWords = queryLower.split(/\s+/).filter(w => w.length > 3);
 
@@ -107,7 +107,7 @@ function findRelevantChunks(query, maxChunks = 8) {
 
   // Falls keine relevanten Chunks gefunden, allgemeine Chunks nehmen
   if (topChunks.length === 0) {
-    return knowledgeChunks.slice(0, 5);
+    return knowledgeChunks.slice(0, 3);
   }
 
   return topChunks;
