@@ -2,11 +2,85 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 const Groq = require('groq-sdk').default;
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// ── User Database (file-based) ──────────────────────────────
+const USERS_DB_PATH = path.join(__dirname, 'data', 'users.json');
+
+function ensureDataDir() {
+  const dir = path.join(__dirname, 'data');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+function loadUsers() {
+  try {
+    return JSON.parse(fs.readFileSync(USERS_DB_PATH, 'utf-8'));
+  } catch {
+    return [];
+  }
+}
+
+function saveUsers(users) {
+  ensureDataDir();
+  fs.writeFileSync(USERS_DB_PATH, JSON.stringify(users, null, 2));
+}
+
+// ── Auth Endpoints ──────────────────────────────────────────
+
+// Register
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password, name } = req.body;
+    if (!email || !password || !name) {
+      return res.status(400).json({ error: 'Alle Felder sind erforderlich' });
+    }
+    const users = loadUsers();
+    if (users.find(u => u.email.toLowerCase() === email.toLowerCase())) {
+      return res.status(409).json({ error: 'Diese E-Mail ist bereits registriert' });
+    }
+    const hash = await bcrypt.hash(password, 10);
+    const user = {
+      id: crypto.randomUUID(),
+      email: email.toLowerCase().trim(),
+      name: name.trim(),
+      password: hash,
+      createdAt: new Date().toISOString(),
+    };
+    users.push(user);
+    saveUsers(users);
+    console.log(`✓ Neuer Benutzer registriert: ${user.email}`);
+    res.json({ id: user.id, email: user.email, name: user.name, createdAt: user.createdAt });
+  } catch (error) {
+    console.error('Register Error:', error);
+    res.status(500).json({ error: 'Registrierung fehlgeschlagen' });
+  }
+});
+
+// Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'E-Mail und Passwort erforderlich' });
+    }
+    const users = loadUsers();
+    const user = users.find(u => u.email === email.toLowerCase().trim());
+    if (!user || !(await bcrypt.compare(password, user.password))) {
+      return res.status(401).json({ error: 'Ungültige E-Mail oder Passwort' });
+    }
+    console.log(`✓ Login: ${user.email}`);
+    res.json({ id: user.id, email: user.email, name: user.name, createdAt: user.createdAt });
+  } catch (error) {
+    console.error('Login Error:', error);
+    res.status(500).json({ error: 'Anmeldung fehlgeschlagen' });
+  }
+});
 
 // Groq Client - API Key aus Umgebungsvariable
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
