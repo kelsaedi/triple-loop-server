@@ -82,6 +82,60 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+// ── User Data Endpoints (assessment + mindset results) ──────
+const USERDATA_DIR = path.join(__dirname, 'data', 'userdata');
+
+function ensureUserDataDir() {
+  if (!fs.existsSync(USERDATA_DIR)) fs.mkdirSync(USERDATA_DIR, { recursive: true });
+}
+
+function getUserDataPath(userId) {
+  return path.join(USERDATA_DIR, `${userId}.json`);
+}
+
+function loadUserData(userId) {
+  try {
+    return JSON.parse(fs.readFileSync(getUserDataPath(userId), 'utf-8'));
+  } catch {
+    return {};
+  }
+}
+
+function saveUserData(userId, data) {
+  ensureUserDataDir();
+  fs.writeFileSync(getUserDataPath(userId), JSON.stringify(data, null, 2));
+}
+
+// Save user data (assessment scores, mindset results, etc.)
+app.post('/api/userdata/:userId', (req, res) => {
+  try {
+    const { userId } = req.params;
+    const data = req.body;
+    if (!userId || !data) {
+      return res.status(400).json({ error: 'UserId und Daten erforderlich' });
+    }
+    const existing = loadUserData(userId);
+    const merged = { ...existing, ...data };
+    saveUserData(userId, merged);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Save userdata error:', error);
+    res.status(500).json({ error: 'Speichern fehlgeschlagen' });
+  }
+});
+
+// Load user data
+app.get('/api/userdata/:userId', (req, res) => {
+  try {
+    const { userId } = req.params;
+    const data = loadUserData(userId);
+    res.json(data);
+  } catch (error) {
+    console.error('Load userdata error:', error);
+    res.status(500).json({ error: 'Laden fehlgeschlagen' });
+  }
+});
+
 // Groq Client - API Key aus Umgebungsvariable
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
