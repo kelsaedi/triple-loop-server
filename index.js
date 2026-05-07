@@ -9,7 +9,10 @@ const { createClient } = require('@libsql/client');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '5mb' }));
+// 50 MB so users can upload PDFs and PPTX decks with embedded images.
+// Storage cost: a single Turso row holds the entire userdata blob, so this
+// is also the practical upper bound per user account.
+app.use(express.json({ limit: '50mb' }));
 
 // ── Turso Cloud Database ────────────────────────────────────
 const db = createClient({
