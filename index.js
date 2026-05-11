@@ -36,6 +36,23 @@ async function initDB() {
       data TEXT NOT NULL DEFAULT '{}'
     )
   `);
+  // Invitations table — lets a project owner generate a one-time link for an
+  // employee (Mitarbeiter:in) to take a single mindset test. The invitee does
+  // not get an account; their result is stored directly on the invite row.
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS invites (
+      token TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      project_name TEXT,
+      owner_user_id TEXT NOT NULL,
+      test_kind TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      invitee_name TEXT,
+      redeemed_at TEXT,
+      result_json TEXT
+    )
+  `);
+  await db.execute('CREATE INDEX IF NOT EXISTS idx_invites_owner ON invites(owner_user_id)');
   console.log('✓ Datenbank initialisiert');
 }
 
@@ -134,6 +151,125 @@ app.get('/api/userdata/:userId', async (req, res) => {
   } catch (error) {
     console.error('Load userdata error:', error);
     res.status(500).json({ error: 'Laden fehlgeschlagen' });
+  }
+});
+
+// ── Invitation Endpoints ────────────────────────────────────
+// Project owners generate one-time invite links so employees can take a
+// single mindset test without creating an account. The invitee identifies
+// themselves by name; their result is stored directly on the invite row.
+
+app.post('/api/invites', async (req, res) => {
+  try {
+    const { ownerUserId, projectId, projectName, testKind } = req.body;
+    if (!ownerUserId || !projectId || !testKind) {
+      return res.status(400).json({ error: 'ownerUserId, projectId, testKind erforderlich' });
+    }
+    if (testKind !== '42' && testKind !== '36') {
+      return res.status(400).json({ error: "testKind muss '42' oder '36' sein" });
+    }
+    const token = crypto.randomBytes(20).toString('hex');
+    const createdAt = new Date().toISOString();
+    await db.execute({
+      sql: 'INSERT INTO invites (token, project_id, project_name, owner_user_id, test_kind, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      args: [token, projectId, projectName || '', ownerUserId, testKind, createdAt],
+    });
+    res.json({ token, createdAt });
+  } catch (error) {
+    console.error('Create invite error:', error);
+    res.status(500).json({ error: 'Einladung erstellen fehlgeschlagen' });
+  }
+});
+
+// Public: invitee fetches what the invite is about (project + test kind).
+app.get('/api/invites/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+    const result = await db.execute({
+      sql: 'SELECT token, project_id, project_name, test_kind, created_at, invitee_name, redeemed_at FROM invites WHERE token = ?',
+      args: [token],
+    });
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Einladung nicht gefunden' });
+    const r = result.rows[0];
+    res.json({
+      token: r.token,
+      projectId: r.project_id,
+      projectName: r.project_name,
+      testKind: r.test_kind,
+      createdAt: r.created_at,
+      inviteeName: r.invitee_name,
+      redeemedAt: r.redeemed_at,
+      isRedeemed: !!r.redeemed_at,
+    });
+  } catch (error) {
+    console.error('Get invite error:', error);
+    res.status(500).json({ error: 'Laden fehlgeschlagen' });
+  }
+});
+
+// Public: invitee submits name + completed test result.
+app.post('/api/invites/:token/submit', async (req, res) => {
+  try {
+    const { token } = req.params;
+    const { inviteeName, resultJson } = req.body;
+    if (!inviteeName || !resultJson) {
+      return res.status(400).json({ error: 'inviteeName und resultJson erforderlich' });
+    }
+    const existing = await db.execute({ sql: 'SELECT token, redeemed_at FROM invites WHERE token = ?', args: [token] });
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Einladung nicht gefunden' });
+    if (existing.rows[0].redeemed_at) return res.status(409).json({ error: 'Einladung bereits eingelöst' });
+    const redeemedAt = new Date().toISOString();
+    await db.execute({
+      sql: 'UPDATE invites SET invitee_name = ?, redeemed_at = ?, result_json = ? WHERE token = ?',
+      args: [String(inviteeName).trim(), redeemedAt, JSON.stringify(resultJson), token],
+    });
+    res.json({ ok: true, redeemedAt });
+  } catch (error) {
+    console.error('Submit invite error:', error);
+    res.status(500).json({ error: 'Speichern fehlgeschlagen' });
+  }
+});
+
+// Owner: list all invites + their (optional) results.
+app.get('/api/users/:userId/invites', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const result = await db.execute({
+      sql: 'SELECT token, project_id, project_name, test_kind, created_at, invitee_name, redeemed_at, result_json FROM invites WHERE owner_user_id = ? ORDER BY created_at DESC',
+      args: [userId],
+    });
+    const invites = result.rows.map((r) => ({
+      token: r.token,
+      projectId: r.project_id,
+      projectName: r.project_name,
+      testKind: r.test_kind,
+      createdAt: r.created_at,
+      inviteeName: r.invitee_name,
+      redeemedAt: r.redeemed_at,
+      isRedeemed: !!r.redeemed_at,
+      result: r.result_json ? JSON.parse(r.result_json) : null,
+    }));
+    res.json({ invites });
+  } catch (error) {
+    console.error('List invites error:', error);
+    res.status(500).json({ error: 'Laden fehlgeschlagen' });
+  }
+});
+
+// Owner: delete an invite (only the creator can).
+app.delete('/api/invites/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+    const { ownerUserId } = req.body;
+    if (!ownerUserId) return res.status(400).json({ error: 'ownerUserId erforderlich' });
+    const existing = await db.execute({ sql: 'SELECT owner_user_id FROM invites WHERE token = ?', args: [token] });
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Einladung nicht gefunden' });
+    if (existing.rows[0].owner_user_id !== ownerUserId) return res.status(403).json({ error: 'Nicht erlaubt' });
+    await db.execute({ sql: 'DELETE FROM invites WHERE token = ?', args: [token] });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Delete invite error:', error);
+    res.status(500).json({ error: 'Löschen fehlgeschlagen' });
   }
 });
 
