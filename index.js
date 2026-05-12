@@ -49,10 +49,23 @@ async function initDB() {
       created_at TEXT NOT NULL,
       invitee_name TEXT,
       redeemed_at TEXT,
-      result_json TEXT
+      result_json TEXT,
+      member_id TEXT,
+      member_first_name TEXT
     )
   `);
+  // ALTER for already-existing rows (idempotent; ignores "duplicate column" errors).
+  // These were added after the initial deploy: per-member invites now scope
+  // each invite to a specific team member so the result lands on their record.
+  for (const col of ['member_id TEXT', 'member_first_name TEXT']) {
+    try {
+      await db.execute(`ALTER TABLE invites ADD COLUMN ${col}`);
+    } catch (e) {
+      // Column already exists — Turso/libSQL returns SQLITE_ERROR with msg "duplicate column name"
+    }
+  }
   await db.execute('CREATE INDEX IF NOT EXISTS idx_invites_owner ON invites(owner_user_id)');
+  await db.execute('CREATE INDEX IF NOT EXISTS idx_invites_member ON invites(member_id)');
   console.log('✓ Datenbank initialisiert');
 }
 
@@ -161,7 +174,7 @@ app.get('/api/userdata/:userId', async (req, res) => {
 
 app.post('/api/invites', async (req, res) => {
   try {
-    const { ownerUserId, projectId, projectName, testKind } = req.body;
+    const { ownerUserId, projectId, projectName, testKind, memberId, memberFirstName } = req.body;
     if (!ownerUserId || !projectId || !testKind) {
       return res.status(400).json({ error: 'ownerUserId, projectId, testKind erforderlich' });
     }
@@ -171,8 +184,8 @@ app.post('/api/invites', async (req, res) => {
     const token = crypto.randomBytes(20).toString('hex');
     const createdAt = new Date().toISOString();
     await db.execute({
-      sql: 'INSERT INTO invites (token, project_id, project_name, owner_user_id, test_kind, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-      args: [token, projectId, projectName || '', ownerUserId, testKind, createdAt],
+      sql: 'INSERT INTO invites (token, project_id, project_name, owner_user_id, test_kind, created_at, member_id, member_first_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      args: [token, projectId, projectName || '', ownerUserId, testKind, createdAt, memberId || null, memberFirstName || null],
     });
     res.json({ token, createdAt });
   } catch (error) {
@@ -186,7 +199,7 @@ app.get('/api/invites/:token', async (req, res) => {
   try {
     const { token } = req.params;
     const result = await db.execute({
-      sql: 'SELECT token, project_id, project_name, test_kind, created_at, invitee_name, redeemed_at FROM invites WHERE token = ?',
+      sql: 'SELECT token, project_id, project_name, test_kind, created_at, invitee_name, redeemed_at, member_id, member_first_name FROM invites WHERE token = ?',
       args: [token],
     });
     if (result.rows.length === 0) return res.status(404).json({ error: 'Einladung nicht gefunden' });
@@ -200,6 +213,8 @@ app.get('/api/invites/:token', async (req, res) => {
       inviteeName: r.invitee_name,
       redeemedAt: r.redeemed_at,
       isRedeemed: !!r.redeemed_at,
+      memberId: r.member_id,
+      memberFirstName: r.member_first_name,
     });
   } catch (error) {
     console.error('Get invite error:', error);
@@ -207,21 +222,31 @@ app.get('/api/invites/:token', async (req, res) => {
   }
 });
 
-// Public: invitee submits name + completed test result.
+// Public: invitee submits completed test result. The name is optional — for
+// per-member invites the name is already on the invite row (member_first_name)
+// and the invitee never gets a "what's your name?" prompt.
 app.post('/api/invites/:token/submit', async (req, res) => {
   try {
     const { token } = req.params;
     const { inviteeName, resultJson } = req.body;
-    if (!inviteeName || !resultJson) {
-      return res.status(400).json({ error: 'inviteeName und resultJson erforderlich' });
+    if (!resultJson) {
+      return res.status(400).json({ error: 'resultJson erforderlich' });
     }
-    const existing = await db.execute({ sql: 'SELECT token, redeemed_at FROM invites WHERE token = ?', args: [token] });
+    const existing = await db.execute({ sql: 'SELECT token, redeemed_at, member_first_name FROM invites WHERE token = ?', args: [token] });
     if (existing.rows.length === 0) return res.status(404).json({ error: 'Einladung nicht gefunden' });
     if (existing.rows[0].redeemed_at) return res.status(409).json({ error: 'Einladung bereits eingelöst' });
+    // Prefer the explicit body name (project-level invite case); fall back to
+    // the pre-known member name (per-member invite case).
+    const nameToStore = (inviteeName && String(inviteeName).trim())
+      || existing.rows[0].member_first_name
+      || '';
+    if (!nameToStore) {
+      return res.status(400).json({ error: 'inviteeName erforderlich' });
+    }
     const redeemedAt = new Date().toISOString();
     await db.execute({
       sql: 'UPDATE invites SET invitee_name = ?, redeemed_at = ?, result_json = ? WHERE token = ?',
-      args: [String(inviteeName).trim(), redeemedAt, JSON.stringify(resultJson), token],
+      args: [nameToStore, redeemedAt, JSON.stringify(resultJson), token],
     });
     res.json({ ok: true, redeemedAt });
   } catch (error) {
@@ -235,7 +260,7 @@ app.get('/api/users/:userId/invites', async (req, res) => {
   try {
     const { userId } = req.params;
     const result = await db.execute({
-      sql: 'SELECT token, project_id, project_name, test_kind, created_at, invitee_name, redeemed_at, result_json FROM invites WHERE owner_user_id = ? ORDER BY created_at DESC',
+      sql: 'SELECT token, project_id, project_name, test_kind, created_at, invitee_name, redeemed_at, result_json, member_id, member_first_name FROM invites WHERE owner_user_id = ? ORDER BY created_at DESC',
       args: [userId],
     });
     const invites = result.rows.map((r) => ({
@@ -248,6 +273,8 @@ app.get('/api/users/:userId/invites', async (req, res) => {
       redeemedAt: r.redeemed_at,
       isRedeemed: !!r.redeemed_at,
       result: r.result_json ? JSON.parse(r.result_json) : null,
+      memberId: r.member_id,
+      memberFirstName: r.member_first_name,
     }));
     res.json({ invites });
   } catch (error) {
