@@ -152,12 +152,29 @@ app.post('/api/userdata/:userId', async (req, res) => {
   }
 });
 
+// GET /api/userdata/:userId
+//   By default returns the user blob WITHOUT projects[].resources[].fileData
+//   so the response stays small (assessment+history sync is the hot path).
+//   File blobs are 99% of the bytes when the user has uploaded any PDFs/PPTX
+//   etc., and on a single Render free-tier dyno the heavy response causes
+//   memory restarts + Safari CORS aborts. Pass `?withFiles=1` to opt into
+//   the full payload (project context uses this for cross-device sync).
 app.get('/api/userdata/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
+    const withFiles = req.query.withFiles === '1' || req.query.withFiles === 'true';
     const result = await db.execute({ sql: 'SELECT data FROM userdata WHERE user_id = ?', args: [userId] });
     if (result.rows.length > 0) {
-      res.json(JSON.parse(result.rows[0].data || '{}'));
+      const data = JSON.parse(result.rows[0].data || '{}');
+      if (!withFiles && Array.isArray(data.projects)) {
+        data.projects = data.projects.map((p) => ({
+          ...p,
+          resources: Array.isArray(p.resources)
+            ? p.resources.map(({ fileData, ...rest }) => rest)
+            : p.resources,
+        }));
+      }
+      res.json(data);
     } else {
       res.json({});
     }
