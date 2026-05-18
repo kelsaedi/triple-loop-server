@@ -66,6 +66,28 @@ async function initDB() {
   }
   await db.execute('CREATE INDEX IF NOT EXISTS idx_invites_owner ON invites(owner_user_id)');
   await db.execute('CREATE INDEX IF NOT EXISTS idx_invites_member ON invites(member_id)');
+
+  // Projekt-Sharing: erlaubt einem Owner, andere Login-User als Admin oder
+  // Mitarbeiter:in (collaborator) zu einem Projekt einzuladen. Der Member-
+  // User sieht das Projekt anschließend in seiner App neben den eigenen.
+  //
+  // role = 'admin'        → voller Zugriff (wie der Owner)
+  // role = 'collaborator' → eingeschränkter Zugriff (Phase 2, aktuell nicht erzwungen)
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS project_shares (
+      share_id TEXT PRIMARY KEY,
+      owner_user_id TEXT NOT NULL,
+      member_user_id TEXT NOT NULL,
+      project_id TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'admin',
+      invited_email TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE(owner_user_id, member_user_id, project_id)
+    )
+  `);
+  await db.execute('CREATE INDEX IF NOT EXISTS idx_shares_member ON project_shares(member_user_id)');
+  await db.execute('CREATE INDEX IF NOT EXISTS idx_shares_owner ON project_shares(owner_user_id)');
+  await db.execute('CREATE INDEX IF NOT EXISTS idx_shares_project ON project_shares(project_id)');
   console.log('✓ Datenbank initialisiert');
 }
 
@@ -313,6 +335,150 @@ app.delete('/api/invites/:token', async (req, res) => {
     res.json({ ok: true });
   } catch (error) {
     console.error('Delete invite error:', error);
+    res.status(500).json({ error: 'Löschen fehlgeschlagen' });
+  }
+});
+
+// ── Projekt-Sharing (Admin / Co-Worker) ────────────────────
+// Erlaubt einem Owner, andere Login-User per Email zu einem seiner Projekte
+// einzuladen. Aktuell wird role='admin' (voller Zugriff) primär unterstützt;
+// role='collaborator' ist eingeplant für Phase 2 (eingeschränkte Sicht).
+//
+// Sicherheitshinweis: Aktuell prüft der Server NICHT, ob der anfragende
+// User wirklich Owner des Projekts ist — der Client schickt ownerUserId
+// im Body und wir vertrauen ihm. Auth-Token + Ownership-Check kommen mit
+// dem grundsätzlichen Auth-Hardening (siehe Roadmap).
+
+// POST /api/projects/share — Owner lädt Member per Email zum Projekt ein.
+app.post('/api/projects/share', async (req, res) => {
+  try {
+    const { ownerUserId, projectId, memberEmail, role } = req.body;
+    if (!ownerUserId || !projectId || !memberEmail) {
+      return res.status(400).json({ error: 'ownerUserId, projectId, memberEmail erforderlich' });
+    }
+    const validRole = role === 'collaborator' ? 'collaborator' : 'admin';
+    const emailLower = String(memberEmail).toLowerCase().trim();
+    const userLookup = await db.execute({
+      sql: 'SELECT id, name, email FROM users WHERE email = ?',
+      args: [emailLower],
+    });
+    if (userLookup.rows.length === 0) {
+      return res.status(404).json({ error: 'Kein User mit dieser E-Mail. Die Person muss sich zuerst registrieren.' });
+    }
+    const member = userLookup.rows[0];
+    if (member.id === ownerUserId) {
+      return res.status(400).json({ error: 'Du kannst dich nicht selbst einladen.' });
+    }
+    const shareId = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+    try {
+      await db.execute({
+        sql: `INSERT INTO project_shares (share_id, owner_user_id, member_user_id, project_id, role, invited_email, created_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        args: [shareId, ownerUserId, member.id, projectId, validRole, emailLower, createdAt],
+      });
+    } catch (e) {
+      // UNIQUE constraint hit → User ist schon eingeladen
+      if (String(e?.message || '').includes('UNIQUE')) {
+        return res.status(409).json({ error: 'Dieser User hat bereits Zugriff auf das Projekt.' });
+      }
+      throw e;
+    }
+    console.log(`✓ Projekt-Share: ${emailLower} → ${projectId} (${validRole})`);
+    res.json({
+      shareId,
+      memberUserId: member.id,
+      memberName: member.name,
+      memberEmail: member.email,
+      role: validRole,
+      createdAt,
+    });
+  } catch (error) {
+    console.error('Share project error:', error);
+    res.status(500).json({ error: 'Teilen fehlgeschlagen' });
+  }
+});
+
+// GET /api/users/:userId/shared-projects — alle Projekte, in denen :userId
+// eingeladen ist. Inkludiert Owner-Info für die UI.
+app.get('/api/users/:userId/shared-projects', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const result = await db.execute({
+      sql: `SELECT s.share_id, s.owner_user_id, s.project_id, s.role, s.created_at,
+                   u.name AS owner_name, u.email AS owner_email
+            FROM project_shares s
+            JOIN users u ON u.id = s.owner_user_id
+            WHERE s.member_user_id = ?
+            ORDER BY s.created_at DESC`,
+      args: [userId],
+    });
+    const shares = result.rows.map((r) => ({
+      shareId: r.share_id,
+      ownerUserId: r.owner_user_id,
+      ownerName: r.owner_name,
+      ownerEmail: r.owner_email,
+      projectId: r.project_id,
+      role: r.role,
+      createdAt: r.created_at,
+    }));
+    res.json({ shares });
+  } catch (error) {
+    console.error('List shared-projects error:', error);
+    res.status(500).json({ error: 'Laden fehlgeschlagen' });
+  }
+});
+
+// GET /api/projects/:projectId/shares?ownerUserId=… — Owner sieht die Liste
+// aller Personen, die Zugriff auf sein Projekt haben.
+app.get('/api/projects/:projectId/shares', async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const { ownerUserId } = req.query;
+    if (!ownerUserId) return res.status(400).json({ error: 'ownerUserId erforderlich' });
+    const result = await db.execute({
+      sql: `SELECT s.share_id, s.member_user_id, s.role, s.created_at, s.invited_email,
+                   u.name AS member_name, u.email AS member_email
+            FROM project_shares s
+            JOIN users u ON u.id = s.member_user_id
+            WHERE s.project_id = ? AND s.owner_user_id = ?
+            ORDER BY s.created_at DESC`,
+      args: [projectId, ownerUserId],
+    });
+    const shares = result.rows.map((r) => ({
+      shareId: r.share_id,
+      memberUserId: r.member_user_id,
+      memberName: r.member_name,
+      memberEmail: r.member_email,
+      invitedEmail: r.invited_email,
+      role: r.role,
+      createdAt: r.created_at,
+    }));
+    res.json({ shares });
+  } catch (error) {
+    console.error('List project shares error:', error);
+    res.status(500).json({ error: 'Laden fehlgeschlagen' });
+  }
+});
+
+// DELETE /api/projects/share/:shareId — Owner entzieht Zugriff.
+app.delete('/api/projects/share/:shareId', async (req, res) => {
+  try {
+    const { shareId } = req.params;
+    const { ownerUserId } = req.body;
+    if (!ownerUserId) return res.status(400).json({ error: 'ownerUserId erforderlich' });
+    const existing = await db.execute({
+      sql: 'SELECT owner_user_id FROM project_shares WHERE share_id = ?',
+      args: [shareId],
+    });
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Share nicht gefunden' });
+    if (existing.rows[0].owner_user_id !== ownerUserId) {
+      return res.status(403).json({ error: 'Nicht erlaubt — nur der Owner kann Zugriffe entziehen.' });
+    }
+    await db.execute({ sql: 'DELETE FROM project_shares WHERE share_id = ?', args: [shareId] });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Delete share error:', error);
     res.status(500).json({ error: 'Löschen fehlgeschlagen' });
   }
 });
