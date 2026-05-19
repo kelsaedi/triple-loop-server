@@ -339,6 +339,46 @@ app.delete('/api/invites/:token', async (req, res) => {
   }
 });
 
+// ── Admin: Passwort manuell zurücksetzen ───────────────────
+// Da die App aktuell keinen Forgot-Password-Flow hat, kann der Plattform-
+// Betreiber Passwörter über diesen Endpoint zurücksetzen. Der adminToken
+// ist im Code hartkodiert (Pilot-Stage); für die Produktion sollte er per
+// ENV-Variable konfigurierbar werden und zusätzlich rotiert werden.
+const ADMIN_RESET_TOKEN = 'tloc-reset-K8XJ9PQ7VbN3FmR4-2026-05-19';
+
+app.post('/api/admin/reset-password', async (req, res) => {
+  try {
+    const { adminToken, email, newPassword } = req.body;
+    if (adminToken !== ADMIN_RESET_TOKEN) {
+      return res.status(403).json({ error: 'Ungültiger Admin-Token' });
+    }
+    if (!email || !newPassword) {
+      return res.status(400).json({ error: 'email und newPassword erforderlich' });
+    }
+    if (String(newPassword).length < 6) {
+      return res.status(400).json({ error: 'Passwort muss mindestens 6 Zeichen haben' });
+    }
+    const emailLower = String(email).toLowerCase().trim();
+    const existing = await db.execute({
+      sql: 'SELECT id, email FROM users WHERE email = ?',
+      args: [emailLower],
+    });
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Kein User mit dieser E-Mail' });
+    }
+    const hash = await bcrypt.hash(newPassword, 10);
+    await db.execute({
+      sql: 'UPDATE users SET password = ? WHERE email = ?',
+      args: [hash, emailLower],
+    });
+    console.log(`✓ Passwort zurückgesetzt für: ${emailLower}`);
+    res.json({ ok: true, email: emailLower });
+  } catch (error) {
+    console.error('Admin reset error:', error);
+    res.status(500).json({ error: 'Reset fehlgeschlagen' });
+  }
+});
+
 // ── Projekt-Sharing (Admin / Co-Worker) ────────────────────
 // Erlaubt einem Owner, andere Login-User per Email zu einem seiner Projekte
 // einzuladen. Aktuell wird role='admin' (voller Zugriff) primär unterstützt;
