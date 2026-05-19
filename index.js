@@ -88,6 +88,23 @@ async function initDB() {
   await db.execute('CREATE INDEX IF NOT EXISTS idx_shares_member ON project_shares(member_user_id)');
   await db.execute('CREATE INDEX IF NOT EXISTS idx_shares_owner ON project_shares(owner_user_id)');
   await db.execute('CREATE INDEX IF NOT EXISTS idx_shares_project ON project_shares(project_id)');
+
+  // Passwort-Reset-Token (Forgot-Password-Flow). Eine User-facing Variante:
+  // Person klickt "Passwort vergessen?", gibt Email ein → Server erzeugt einen
+  // einmaligen Token, schickt einen Reset-Link per Mail. Token läuft nach
+  // 1 Stunde ab und kann nur einmal verwendet werden.
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      token TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      email TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used_at TEXT
+    )
+  `);
+  await db.execute('CREATE INDEX IF NOT EXISTS idx_reset_user ON password_reset_tokens(user_id)');
+  await db.execute('CREATE INDEX IF NOT EXISTS idx_reset_email ON password_reset_tokens(email)');
   console.log('✓ Datenbank initialisiert');
 }
 
@@ -336,6 +353,170 @@ app.delete('/api/invites/:token', async (req, res) => {
   } catch (error) {
     console.error('Delete invite error:', error);
     res.status(500).json({ error: 'Löschen fehlgeschlagen' });
+  }
+});
+
+// ── Email-Versand (Resend) ─────────────────────────────────
+// Wenn RESEND_API_KEY in den ENV-Variablen gesetzt ist, schicken wir
+// transaktionale Emails über api.resend.com. Ohne API-Key bleibt das System
+// funktionsfähig — der Token landet stattdessen in den Server-Logs, sodass
+// der Plattform-Betreiber ihn manuell an die Person weiterleiten kann.
+//
+// Reply-To-Adresse via RESEND_FROM steuerbar; Default `onboarding@resend.dev`
+// (Resend-Testdomain, funktioniert ohne eigenes DNS-Setup).
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const RESEND_FROM = process.env.RESEND_FROM || 'Triple Loop <onboarding@resend.dev>';
+const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'https://leadership-strategy-research.pages.dev';
+
+async function sendEmail({ to, subject, html, text }) {
+  if (!RESEND_API_KEY) {
+    console.log('[email] (kein RESEND_API_KEY) Würde senden an', to, '·', subject);
+    console.log('[email] Text:', text);
+    return { delivered: false, reason: 'no_api_key' };
+  }
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ from: RESEND_FROM, to: [to], subject, html, text }),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.error('[email] Resend error', res.status, body);
+      return { delivered: false, reason: 'api_error', status: res.status };
+    }
+    console.log(`[email] sent to ${to}: ${subject}`);
+    return { delivered: true };
+  } catch (e) {
+    console.error('[email] network error', e);
+    return { delivered: false, reason: 'network_error' };
+  }
+}
+
+// ── Forgot-Password / Reset (User-facing) ──────────────────
+// Ein Klick auf "Passwort vergessen?" im Login-Formular liefert die Email
+// hier ab. Wir erzeugen einen einmaligen Token (1h Gültigkeit), speichern
+// ihn und verschicken den Reset-Link per Mail. Aus Privacy-Gründen
+// geben wir IMMER 200 zurück — ob die Email existiert, bleibt geheim.
+
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'email erforderlich' });
+    const emailLower = String(email).toLowerCase().trim();
+
+    const lookup = await db.execute({
+      sql: 'SELECT id, email, name FROM users WHERE email = ?',
+      args: [emailLower],
+    });
+
+    // Always-200-Pattern: kein Hinweis, ob Email existiert
+    if (lookup.rows.length === 0) {
+      console.log(`[forgot-password] Versuch für unbekannte Email: ${emailLower}`);
+      return res.json({ ok: true });
+    }
+
+    const user = lookup.rows[0];
+    const token = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+    const now = new Date();
+    const expires = new Date(now.getTime() + 60 * 60 * 1000); // 1h
+    await db.execute({
+      sql: `INSERT INTO password_reset_tokens (token, user_id, email, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?)`,
+      args: [token, user.id, user.email, now.toISOString(), expires.toISOString()],
+    });
+
+    const resetUrl = `${FRONTEND_BASE_URL}/?reset=${token}`;
+    const greeting = user.name ? `Hallo ${user.name}` : 'Hallo';
+    const html = `
+      <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 0 auto; padding: 24px; color: #0F172A;">
+        <h2 style="margin: 0 0 16px 0; color: #4A9EFF;">Passwort zurücksetzen</h2>
+        <p>${greeting},</p>
+        <p>du hast einen Reset für dein Passwort auf der Triple-Loop-of-Change-Plattform angefordert. Klick auf den folgenden Link, um ein neues Passwort zu setzen:</p>
+        <p style="margin: 24px 0;">
+          <a href="${resetUrl}" style="display: inline-block; background: #4A9EFF; color: #FFFFFF; text-decoration: none; padding: 12px 22px; border-radius: 8px; font-weight: 600;">
+            Neues Passwort setzen
+          </a>
+        </p>
+        <p style="font-size: 13px; color: #64748B;">Oder kopiere diesen Link manuell in deinen Browser:<br><span style="word-break: break-all;">${resetUrl}</span></p>
+        <p style="font-size: 13px; color: #64748B;">Der Link ist 1 Stunde gültig und kann nur einmal verwendet werden.</p>
+        <p style="font-size: 13px; color: #64748B;">Wenn du keinen Reset angefordert hast, kannst du diese Mail ignorieren — dein Passwort bleibt unverändert.</p>
+        <hr style="border: none; border-top: 1px solid #E2E8F0; margin: 24px 0;">
+        <p style="font-size: 12px; color: #94A3B8;">TU Wien · Institut Leadership & Strategy<br>Triple Loop of Change Plattform</p>
+      </div>
+    `;
+    const text = `${greeting},
+
+du hast einen Reset für dein Passwort auf der Triple-Loop-of-Change-Plattform angefordert.
+
+Setze dein neues Passwort hier:
+${resetUrl}
+
+Der Link ist 1 Stunde gültig und kann nur einmal verwendet werden.
+
+Wenn du keinen Reset angefordert hast, kannst du diese Mail ignorieren.
+
+— Triple Loop of Change Plattform, TU Wien Leadership & Strategy`;
+
+    const sendResult = await sendEmail({
+      to: emailLower,
+      subject: 'Passwort zurücksetzen — Triple Loop of Change',
+      html,
+      text,
+    });
+    // Wenn der Email-Versand nicht eingerichtet ist, geben wir den Token
+    // hier nur ins Server-Log; trotzdem 200 zurück, damit der Frontend-Flow
+    // gleich aussieht (Privacy).
+    if (!sendResult.delivered) {
+      console.log(`[forgot-password] Fallback-Token für ${emailLower}: ${resetUrl}`);
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Forgot-password error:', error);
+    res.status(500).json({ error: 'Reset-Anfrage fehlgeschlagen' });
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { token, newPassword } = req.body;
+    if (!token || !newPassword) {
+      return res.status(400).json({ error: 'token und newPassword erforderlich' });
+    }
+    if (String(newPassword).length < 6) {
+      return res.status(400).json({ error: 'Passwort muss mindestens 6 Zeichen haben' });
+    }
+    const lookup = await db.execute({
+      sql: 'SELECT token, user_id, email, expires_at, used_at FROM password_reset_tokens WHERE token = ?',
+      args: [token],
+    });
+    if (lookup.rows.length === 0) {
+      return res.status(400).json({ error: 'Reset-Link ist ungültig.' });
+    }
+    const row = lookup.rows[0];
+    if (row.used_at) {
+      return res.status(400).json({ error: 'Reset-Link wurde bereits verwendet.' });
+    }
+    if (new Date(row.expires_at).getTime() < Date.now()) {
+      return res.status(400).json({ error: 'Reset-Link ist abgelaufen. Bitte neu anfordern.' });
+    }
+    const hash = await bcrypt.hash(newPassword, 10);
+    await db.execute({
+      sql: 'UPDATE users SET password = ? WHERE id = ?',
+      args: [hash, row.user_id],
+    });
+    await db.execute({
+      sql: 'UPDATE password_reset_tokens SET used_at = ? WHERE token = ?',
+      args: [new Date().toISOString(), token],
+    });
+    console.log(`✓ Passwort über Token zurückgesetzt: ${row.email}`);
+    res.json({ ok: true, email: row.email });
+  } catch (error) {
+    console.error('Reset-password error:', error);
+    res.status(500).json({ error: 'Reset fehlgeschlagen' });
   }
 });
 
