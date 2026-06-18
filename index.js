@@ -816,6 +816,57 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
+// ── V2 Mindset-Test: Population-Mittelwerte ─────────────────
+// Sammelt anonyme Antworten aller User, die den V2-Mindset-Test abgeschlossen
+// haben, und berechnet pro Item den Antwort-Mittelwert. Der Mittelwert ersetzt
+// im Result-Screen den 50%-Default und zeigt: "wo stehst du im Vergleich zu
+// allen Befragten?". Cache 10 Min, damit ein Render-Free-Plan nicht jeden
+// Aufruf die ganze userdata-Tabelle scannt.
+let mindsetNormsCache = { computedAt: 0, payload: null };
+const MINDSET_NORMS_TTL_MS = 10 * 60 * 1000;
+
+app.get('/api/mindset-norms/v2', async (req, res) => {
+  try {
+    const now = Date.now();
+    if (mindsetNormsCache.payload && now - mindsetNormsCache.computedAt < MINDSET_NORMS_TTL_MS) {
+      return res.json(mindsetNormsCache.payload);
+    }
+    // Scan userdata, extract mindsetV2Result.answers pro User (nur letzter Run zählt)
+    const rows = await db.execute({ sql: 'SELECT data FROM userdata', args: [] });
+    const sums = {};        // itemId → Summe aller Antworten
+    const counts = {};      // itemId → Anzahl Antworten
+    let respondents = 0;
+    for (const row of rows.rows) {
+      let blob;
+      try { blob = JSON.parse(row.data || '{}'); } catch { continue; }
+      const v2 = blob.mindsetV2Result;
+      if (!v2 || typeof v2.answers !== 'object' || v2.answers === null) continue;
+      respondents += 1;
+      for (const [itemId, value] of Object.entries(v2.answers)) {
+        if (typeof value !== 'number' || !isFinite(value)) continue;
+        sums[itemId] = (sums[itemId] || 0) + value;
+        counts[itemId] = (counts[itemId] || 0) + 1;
+      }
+    }
+    const norms = {};
+    for (const itemId of Object.keys(sums)) {
+      norms[itemId] = Math.round((sums[itemId] / counts[itemId]) * 100) / 100;
+    }
+    const payload = {
+      norms,
+      counts,
+      totalRespondents: respondents,
+      computedAt: new Date(now).toISOString(),
+      cacheTtlSec: MINDSET_NORMS_TTL_MS / 1000,
+    };
+    mindsetNormsCache = { computedAt: now, payload };
+    res.json(payload);
+  } catch (error) {
+    console.error('mindset-norms/v2 error:', error);
+    res.status(500).json({ error: 'Norm-Berechnung fehlgeschlagen' });
+  }
+});
+
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', chunks: knowledgeChunks.length });
 });
