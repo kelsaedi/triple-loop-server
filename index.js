@@ -822,8 +822,16 @@ app.post('/api/chat', async (req, res) => {
 // im Result-Screen den 50%-Default und zeigt: "wo stehst du im Vergleich zu
 // allen Befragten?". Cache 10 Min, damit ein Render-Free-Plan nicht jeden
 // Aufruf die ganze userdata-Tabelle scannt.
+//
+// Threshold (eingeführt 2026-06-19): unterhalb von MIN_RESPONDENTS sendet
+// der Endpoint LEERE `norms`. Der Client merged dann mit den neutralen
+// Default-Werten (3.0 für Mindset-Items, 2.5 für options4) → alle Balken
+// vergleichen gegen 50 %. Sobald >= MIN_RESPONDENTS Tests gespeichert sind,
+// werden die echten Mittelwerte ausgeliefert. So vermeiden wir, dass die
+// ersten 1-2 Test-Personen die "Population" definieren.
 let mindsetNormsCache = { computedAt: 0, payload: null };
 const MINDSET_NORMS_TTL_MS = 10 * 60 * 1000;
+const MIN_RESPONDENTS = 3;
 
 app.get('/api/mindset-norms/v2', async (req, res) => {
   try {
@@ -848,14 +856,20 @@ app.get('/api/mindset-norms/v2', async (req, res) => {
         counts[itemId] = (counts[itemId] || 0) + 1;
       }
     }
-    const norms = {};
-    for (const itemId of Object.keys(sums)) {
-      norms[itemId] = Math.round((sums[itemId] / counts[itemId]) * 100) / 100;
+    // Threshold-Check: bei zu wenigen Antworten liefere LEERE norms
+    let norms = {};
+    let thresholdReached = respondents >= MIN_RESPONDENTS;
+    if (thresholdReached) {
+      for (const itemId of Object.keys(sums)) {
+        norms[itemId] = Math.round((sums[itemId] / counts[itemId]) * 100) / 100;
+      }
     }
     const payload = {
       norms,
       counts,
       totalRespondents: respondents,
+      minRespondents: MIN_RESPONDENTS,
+      thresholdReached,
       computedAt: new Date(now).toISOString(),
       cacheTtlSec: MINDSET_NORMS_TTL_MS / 1000,
     };
@@ -864,6 +878,105 @@ app.get('/api/mindset-norms/v2', async (req, res) => {
   } catch (error) {
     console.error('mindset-norms/v2 error:', error);
     res.status(500).json({ error: 'Norm-Berechnung fehlgeschlagen' });
+  }
+});
+
+// ── V2 Forschungs-Sicht: alle Antworten mit User-Info ──────
+// Master-Admin / Forschungs-Whitelist sieht hier ALLE V2-Test-Abschlüsse
+// inkl. User-Name + E-Mail + Antworten. Nur User auf der Whitelist
+// (RESEARCH_USER_IDS oder RESEARCH_EMAILS, beide ENV-Variablen, kommagetrennt)
+// erhalten Zugriff. Antwort enthält pro User: id/name/email + V2-Antworten
+// + completedAt + Anzahl Test-Runs in der History.
+function isResearchAccount(userIdOrEmail) {
+  const idList = (process.env.RESEARCH_USER_IDS || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const emailList = (process.env.RESEARCH_EMAILS || '').split(',').map((s) => s.toLowerCase().trim()).filter(Boolean);
+  // Fallback: erlaubt für E-Mails aus der Spec-Whitelist (Forschungsteam)
+  const FALLBACK_RESEARCH_EMAILS = [
+    'karim261000@gmail.com',
+    'astrid@kleinhanns.at',
+    'elsaedi.business@gmail.com',
+    'wolfgang.guettel@tuwien.ac.at',
+  ];
+  const e = String(userIdOrEmail || '').toLowerCase().trim();
+  if (idList.includes(String(userIdOrEmail || ''))) return true;
+  if (emailList.includes(e)) return true;
+  if (FALLBACK_RESEARCH_EMAILS.includes(e)) return true;
+  return false;
+}
+
+app.get('/api/research/v2-responses', async (req, res) => {
+  try {
+    const requester = req.query.requesterId || req.query.requesterEmail;
+    if (!requester || !isResearchAccount(requester)) {
+      return res.status(403).json({ error: 'Nicht autorisiert. Auf Forschungs-Whitelist setzen lassen.' });
+    }
+    const users = await db.execute({ sql: 'SELECT id, name, email FROM users', args: [] });
+    const userMap = {};
+    for (const u of users.rows) userMap[u.id] = { id: u.id, name: u.name, email: u.email };
+    const rows = await db.execute({ sql: 'SELECT user_id, data FROM userdata', args: [] });
+    const records = [];
+    for (const row of rows.rows) {
+      let blob;
+      try { blob = JSON.parse(row.data || '{}'); } catch { continue; }
+      const v2 = blob.mindsetV2Result;
+      const v2Hist = Array.isArray(blob.mindsetV2History) ? blob.mindsetV2History : [];
+      if (!v2 || typeof v2.answers !== 'object' || v2.answers === null) continue;
+      const u = userMap[row.user_id] || { id: row.user_id, name: '(unbekannt)', email: null };
+      records.push({
+        userId: u.id,
+        name: u.name,
+        email: u.email,
+        completedAt: v2.completedAt || null,
+        answers: v2.answers,
+        historyCount: v2Hist.length,
+        history: v2Hist.map((h) => ({
+          id: h.id, completedAt: h.completedAt,
+          answers: h.answers,
+        })),
+      });
+    }
+    res.json({
+      records,
+      totalRespondents: records.length,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('research/v2-responses error:', error);
+    res.status(500).json({ error: 'Forschungs-Sicht fehlgeschlagen' });
+  }
+});
+
+// Admin-Reset für V2-Norms: löscht mindsetV2Result + mindsetV2History von
+// ALLEN Usern. Nur über das Admin-Reset-Token (siehe /api/admin/reset-password).
+// Nutzungsidee: Vor Beginn der Pilotstudie alle Test-Daten verwerfen.
+app.post('/api/admin/reset-v2-norms', async (req, res) => {
+  try {
+    const { token } = req.body || {};
+    const ADMIN_TOKEN = 'tloc-reset-K8XJ9PQ7VbN3FmR4-2026-05-19';
+    if (token !== ADMIN_TOKEN) {
+      return res.status(403).json({ error: 'Ungültiger Admin-Token' });
+    }
+    const rows = await db.execute({ sql: 'SELECT user_id, data FROM userdata', args: [] });
+    let cleared = 0;
+    for (const row of rows.rows) {
+      let blob;
+      try { blob = JSON.parse(row.data || '{}'); } catch { continue; }
+      const hadV2 = !!blob.mindsetV2Result || (Array.isArray(blob.mindsetV2History) && blob.mindsetV2History.length > 0);
+      if (!hadV2) continue;
+      delete blob.mindsetV2Result;
+      delete blob.mindsetV2History;
+      await db.execute({
+        sql: 'UPDATE userdata SET data = ? WHERE user_id = ?',
+        args: [JSON.stringify(blob), row.user_id],
+      });
+      cleared += 1;
+    }
+    // Cache invalidieren
+    mindsetNormsCache = { computedAt: 0, payload: null };
+    res.json({ ok: true, clearedUsers: cleared });
+  } catch (error) {
+    console.error('reset-v2-norms error:', error);
+    res.status(500).json({ error: 'Reset fehlgeschlagen' });
   }
 });
 
