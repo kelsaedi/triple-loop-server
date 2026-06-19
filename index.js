@@ -234,8 +234,8 @@ app.post('/api/invites', async (req, res) => {
     if (!ownerUserId || !projectId || !testKind) {
       return res.status(400).json({ error: 'ownerUserId, projectId, testKind erforderlich' });
     }
-    if (testKind !== '42' && testKind !== '36') {
-      return res.status(400).json({ error: "testKind muss '42' oder '36' sein" });
+    if (testKind !== '42' && testKind !== '36' && testKind !== 'v2') {
+      return res.status(400).json({ error: "testKind muss '42', '36' oder 'v2' sein" });
     }
     const token = crypto.randomBytes(20).toString('hex');
     const createdAt = new Date().toISOString();
