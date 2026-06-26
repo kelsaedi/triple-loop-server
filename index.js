@@ -831,7 +831,10 @@ app.post('/api/chat', async (req, res) => {
 // ersten 1-2 Test-Personen die "Population" definieren.
 let mindsetNormsCache = { computedAt: 0, payload: null };
 const MINDSET_NORMS_TTL_MS = 10 * 60 * 1000;
-const MIN_RESPONDENTS = 3;
+// Threshold ab dem die Population-Norms aktiviert werden. Hochgezogen
+// von 3 auf 15 (2026-06-19 Kariem) — stabilere Statistik bevor die
+// Norm-Werte den 50%-Default ersetzen.
+const MIN_RESPONDENTS = 15;
 
 app.get('/api/mindset-norms/v2', async (req, res) => {
   try {
@@ -839,16 +842,22 @@ app.get('/api/mindset-norms/v2', async (req, res) => {
     if (mindsetNormsCache.payload && now - mindsetNormsCache.computedAt < MINDSET_NORMS_TTL_MS) {
       return res.json(mindsetNormsCache.payload);
     }
-    // Scan userdata, extract mindsetV2Result.answers pro User (nur letzter Run zählt)
+    // Scan userdata, extract mindsetV2Result.answers pro User (nur letzter Run zählt).
+    // User mit excludedFromNorms=true werden nicht zur Population gerechnet.
     const rows = await db.execute({ sql: 'SELECT data FROM userdata', args: [] });
     const sums = {};        // itemId → Summe aller Antworten
     const counts = {};      // itemId → Anzahl Antworten
     let respondents = 0;
+    let excludedCount = 0;
     for (const row of rows.rows) {
       let blob;
       try { blob = JSON.parse(row.data || '{}'); } catch { continue; }
       const v2 = blob.mindsetV2Result;
       if (!v2 || typeof v2.answers !== 'object' || v2.answers === null) continue;
+      if (blob.mindsetV2ExcludedFromNorms === true) {
+        excludedCount += 1;
+        continue;
+      }
       respondents += 1;
       for (const [itemId, value] of Object.entries(v2.answers)) {
         if (typeof value !== 'number' || !isFinite(value)) continue;
@@ -868,6 +877,7 @@ app.get('/api/mindset-norms/v2', async (req, res) => {
       norms,
       counts,
       totalRespondents: respondents,
+      excludedCount,
       minRespondents: MIN_RESPONDENTS,
       thresholdReached,
       computedAt: new Date(now).toISOString(),
@@ -929,6 +939,9 @@ app.get('/api/research/v2-responses', async (req, res) => {
         completedAt: v2.completedAt || null,
         answers: v2.answers,
         historyCount: v2Hist.length,
+        excludedFromNorms: blob.mindsetV2ExcludedFromNorms === true,
+        excludedAt: blob.mindsetV2ExcludedAt || null,
+        excludedBy: blob.mindsetV2ExcludedBy || null,
         history: v2Hist.map((h) => ({
           id: h.id, completedAt: h.completedAt,
           answers: h.answers,
@@ -943,6 +956,49 @@ app.get('/api/research/v2-responses', async (req, res) => {
   } catch (error) {
     console.error('research/v2-responses error:', error);
     res.status(500).json({ error: 'Forschungs-Sicht fehlgeschlagen' });
+  }
+});
+
+// Markiere/Entferne eine Person aus der Norm-Berechnung. Forschungs-Whitelist
+// reicht — kein Admin-Token nötig, weil reversibel + Audit-Log-fähig.
+app.post('/api/research/exclude-from-norms', async (req, res) => {
+  try {
+    const { requesterEmail, userId, excluded } = req.body || {};
+    if (!requesterEmail || !isResearchAccount(requesterEmail)) {
+      return res.status(403).json({ error: 'Nicht autorisiert.' });
+    }
+    if (!userId || typeof excluded !== 'boolean') {
+      return res.status(400).json({ error: 'userId und excluded (boolean) erforderlich.' });
+    }
+    const result = await db.execute({
+      sql: 'SELECT data FROM userdata WHERE user_id = ?',
+      args: [userId],
+    });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User nicht gefunden.' });
+    }
+    let blob;
+    try { blob = JSON.parse(result.rows[0].data || '{}'); } catch { blob = {}; }
+    if (excluded) {
+      blob.mindsetV2ExcludedFromNorms = true;
+      blob.mindsetV2ExcludedAt = new Date().toISOString();
+      blob.mindsetV2ExcludedBy = String(requesterEmail).toLowerCase().trim();
+    } else {
+      delete blob.mindsetV2ExcludedFromNorms;
+      delete blob.mindsetV2ExcludedAt;
+      delete blob.mindsetV2ExcludedBy;
+    }
+    await db.execute({
+      sql: 'UPDATE userdata SET data = ? WHERE user_id = ?',
+      args: [JSON.stringify(blob), userId],
+    });
+    // Cache invalidieren — Norms beim nächsten Request neu berechnen
+    mindsetNormsCache = { computedAt: 0, payload: null };
+    console.log(`[research] ${requesterEmail} setzt excludedFromNorms=${excluded} für user=${userId}`);
+    res.json({ ok: true, userId, excluded });
+  } catch (error) {
+    console.error('exclude-from-norms error:', error);
+    res.status(500).json({ error: 'Exclude-Update fehlgeschlagen' });
   }
 });
 
